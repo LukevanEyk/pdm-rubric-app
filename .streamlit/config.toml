@@ -2,4 +2,5 @@
 gatherUsageStats = false
 
 [server]
-runOnSave = true
+runOnSave = false
+fileWatcherType = "none"
