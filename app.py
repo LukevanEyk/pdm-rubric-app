@@ -1,30 +1,21 @@
 import os
 from typing import Optional, Dict, Tuple
 from datetime import datetime
+from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 
-# ========= Database config =========
-def get_database_url() -> str:
-    # Prefer Streamlit secrets; fall back to env var
-    url = st.secrets.get("DATABASE_URL", os.environ.get("DATABASE_URL", ""))
-    return url
+# =========================
+# Streamlit page
+# =========================
+st.set_page_config(page_title="PdM Rubric Scoring", layout="wide")
+st.title("PdM Rubric Scoring & Repository")
 
-DB_URL = get_database_url()
-if not DB_URL:
-    st.error(
-        "DATABASE_URL is not set. Add it to `.streamlit/secrets.toml` for local use "
-        "and to your Streamlit Cloud app secrets.\n\n"
-        "Example:\nDATABASE_URL = "
-        "\"postgresql+psycopg://postgres:<PASSWORD>@db.<hash>.supabase.co:5432/postgres?sslmode=require\""
-    )
-    st.stop()
-
-engine = create_engine(DB_URL, pool_pre_ping=True)
-
-# ========= Compatibility helpers =========
+# =========================
+# Helpers: UI compatibility
+# =========================
 def df_show(df: pd.DataFrame, height: Optional[int] = None):
     try:
         st.dataframe(df, use_container_width=True, height=height)
@@ -43,8 +34,33 @@ def radio_compat(label, options, index=0, key=None, horizontal=True):
     except TypeError:
         return st.radio(label, options, index=index, key=key)
 
-# ========= Schema & seed =========
-def init_db():
+# =========================
+# Database: engine + schema
+# =========================
+def _database_url() -> str:
+    url = st.secrets.get("DATABASE_URL", os.environ.get("DATABASE_URL", ""))
+    return url
+
+@st.cache_resource(show_spinner=False)
+def get_engine_and_init():
+    """
+    Create the SQLAlchemy engine once per server and ensure schema is present.
+    This prevents repeated connects/initialisation on every small rerun.
+    """
+    url = _database_url()
+    if not url:
+        raise RuntimeError("DATABASE_URL missing in secrets or environment.")
+
+    # Small, conservative pool; pre-ping to drop dead conns; short connect timeout.
+    engine = create_engine(
+        url,
+        pool_pre_ping=True,
+        pool_size=2,
+        max_overflow=0,
+        pool_recycle=300,
+        connect_args={"connect_timeout": 5},
+    )
+
     with engine.begin() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS rubric (
@@ -85,14 +101,14 @@ def init_db():
         """))
 
         # Seed rubric if empty
-        n = conn.execute(text("SELECT COUNT(*) FROM rubric;")).scalar_one()
-        if n == 0:
+        if conn.execute(text("SELECT COUNT(*) FROM rubric;")).scalar_one() == 0:
             seed_rubric(conn)
 
         # Seed weights if empty
-        n = conn.execute(text("SELECT COUNT(*) FROM weights;")).scalar_one()
-        if n == 0:
+        if conn.execute(text("SELECT COUNT(*) FROM weights;")).scalar_one() == 0:
             seed_weights(conn)
+
+    return engine
 
 def seed_rubric(conn):
     entries = [
@@ -175,7 +191,20 @@ def seed_weights(conn):
             {"d": dim, "w": float(w), "r": reason, "t": now}
         )
 
-# ========= Data access =========
+# Try to create/connect once; don't crash UI on hiccups
+try:
+    engine = get_engine_and_init()
+    DB_OK = True
+except Exception as e:
+    engine = None
+    DB_OK = False
+    st.warning("Database isn’t reachable right now. You can still fill the form; click **Retry connection** later to save.")
+    if st.button("Retry connection"):
+        st.rerun()
+
+# =========================
+# Data access funcs
+# =========================
 def load_rubric_df() -> pd.DataFrame:
     with engine.connect() as conn:
         return pd.read_sql_query(
@@ -237,7 +266,6 @@ def upsert_study(meta: dict, rows: pd.DataFrame, study_id: Optional[int] = None)
             )
             conn.execute(text("DELETE FROM study_score WHERE study_id=:id;"), {"id": study_id})
 
-        # insert scores
         for _, r in rows.iterrows():
             conn.execute(
                 text("""
@@ -283,7 +311,9 @@ def get_study_scores(study_id: int):
         """), conn, params={"id": study_id})
     return meta_df.iloc[0].to_dict(), scores_df
 
-# ========= Rubric helpers =========
+# =========================
+# Rubric helpers & scoring
+# =========================
 def possible_scores_map(rubric_df: pd.DataFrame):
     mp = {}
     for _, r in rubric_df.iterrows():
@@ -324,7 +354,6 @@ def rows_from_db(rubric_df: pd.DataFrame, score_df: pd.DataFrame) -> pd.DataFram
             rows.at[idx, "Reason"] = m.iloc[0].get("Reason", "") or ""
     return rows
 
-# ========= Scoring logic =========
 def compute_dimension_scores(rows: pd.DataFrame, mp) -> Dict[str, Dict[str, float]]:
     out = {}
     if rows.empty:
@@ -362,24 +391,47 @@ def final_impact_score(dim_scores: Dict[str, Dict[str, float]], wnorm: Dict[str,
         total += w * s
     return float(total)
 
-# ========= App =========
-st.set_page_config(page_title="PdM Rubric Scoring", layout="wide")
-st.title("PdM Rubric Scoring & Repository")
+# =========================
+# Load rubric/weights (tolerant)
+# =========================
+if DB_OK:
+    try:
+        rubric_df = load_rubric_df()
+    except Exception:
+        st.info("Rubric temporarily unavailable; empty rubric shown.")
+        rubric_df = pd.DataFrame(columns=["dimension","subdimension","score","explanation"])
+    try:
+        weights_df = load_weights_df()
+    except Exception:
+        st.info("Weights temporarily unavailable; defaults will apply.")
+        weights_df = pd.DataFrame(columns=["dimension","base_weight","reason","updated_at"])
+else:
+    rubric_df = pd.DataFrame(columns=["dimension","subdimension","score","explanation"])
+    weights_df = pd.DataFrame(columns=["dimension","base_weight","reason","updated_at"])
 
-init_db()
-rubric_df = load_rubric_df()
-weights_df = load_weights_df()
-mp = possible_scores_map(rubric_df)
-dim_order = [d for d, _ in dimension_structure(rubric_df)]
-wnorm_map = weights_normalised(weights_df, dim_order)
+mp = possible_scores_map(rubric_df) if not rubric_df.empty else {}
+dim_order = [d for d, _ in dimension_structure(rubric_df)] if not rubric_df.empty else []
 
-tabs = st.tabs(["Score a Case Study", "Weights & Rationale", "Browse Database", "Manage Rubric"])
+# =========================
+# Tabs (requested order)
+# =========================
+tabs = st.tabs(["Score a Case Study", "Browse Database", "Weights & Rationale", "Manage Rubric"])
 
-# ---- Tab 1: Scoring ----
+# --------------------------------------------------------------------
+# TAB 1: SCORE A CASE STUDY  (single Save button; no preview breakdown)
+# --------------------------------------------------------------------
 with tabs[0]:
-    # Load / New controls
     st.subheader("Load or start new")
-    lst = list_studies_df()
+
+    # List studies (tolerant)
+    lst = pd.DataFrame()
+    if DB_OK:
+        try:
+            lst = list_studies_df()
+        except Exception:
+            st.info("Couldn’t fetch the study list just now. You can still create a new entry; try reload later.")
+            lst = pd.DataFrame()
+
     if not lst.empty:
         labels, id_map = [], {}
         for _, row in lst.iterrows():
@@ -392,15 +444,21 @@ with tabs[0]:
             choice = selectbox_compat("Pick a study to load", options=labels, index=0, key="load_choice")
         with cBtnL:
             if st.button("Load selected"):
-                sid = id_map[st.session_state["load_choice"]]
-                meta, score_df = get_study_scores(sid)
-                st.session_state["editing_study_id"] = sid
-                st.session_state["meta_title"] = meta.get("title", "")
-                st.session_state["meta_authors"] = meta.get("authors", "")
-                st.session_state["meta_year"] = int(meta["year"]) if meta.get("year") is not None else 2025
-                st.session_state["meta_reviewer"] = meta.get("reviewer", "")
-                st.session_state["score_rows"] = rows_from_db(rubric_df, score_df)
-                st.success(f"Loaded study ID {sid} for editing.")
+                if not rubric_df.empty:
+                    sid = id_map[st.session_state["load_choice"]]
+                    try:
+                        meta, score_df = get_study_scores(sid)
+                        st.session_state["editing_study_id"] = sid
+                        st.session_state["meta_title"] = meta.get("title", "")
+                        st.session_state["meta_authors"] = meta.get("authors", "")
+                        st.session_state["meta_year"] = int(meta["year"]) if meta.get("year") is not None else 2025
+                        st.session_state["meta_reviewer"] = meta.get("reviewer", "")
+                        st.session_state["score_rows"] = rows_from_db(rubric_df, score_df)
+                        st.success(f"Loaded study ID {sid} for editing.")
+                    except Exception as e:
+                        st.error(f"Failed to load study: {e}")
+                else:
+                    st.error("Rubric not available; cannot load scores right now.")
         with cNew:
             if st.button("New entry"):
                 st.session_state["editing_study_id"] = None
@@ -408,54 +466,53 @@ with tabs[0]:
                 st.session_state["meta_authors"] = ""
                 st.session_state["meta_year"] = 2025
                 st.session_state["meta_reviewer"] = ""
-                st.session_state["score_rows"] = blank_rows_from_rubric(rubric_df)
+                st.session_state["score_rows"] = blank_rows_from_rubric(rubric_df) if not rubric_df.empty else pd.DataFrame()
                 st.info("Cleared form for a new entry.")
     else:
         st.info("No saved studies yet. Start a new entry below.")
 
     st.markdown("---")
-    st.subheader("1) Study Metadata")
+    st.subheader("1) Study metadata")
 
+    # Defaults in session_state
     st.session_state.setdefault("editing_study_id", None)
     st.session_state.setdefault("meta_title", "")
     st.session_state.setdefault("meta_authors", "")
     st.session_state.setdefault("meta_year", 2025)
     st.session_state.setdefault("meta_reviewer", "")
-    st.session_state.setdefault("score_rows", blank_rows_from_rubric(rubric_df))
+    st.session_state.setdefault("score_rows", blank_rows_from_rubric(rubric_df) if not rubric_df.empty else pd.DataFrame())
 
-    with st.form("meta_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            title = st.text_input("Title *", key="meta_title")
-            authors = st.text_input("Authors", key="meta_authors")
-        with col2:
-            year = st.number_input("Year", min_value=1900, max_value=2100, step=1, key="meta_year")
-            reviewer = st.text_input("Reviewer (your name)", key="meta_reviewer")
-        _ = st.form_submit_button("Apply metadata (continue below)")
+    # Simple inputs (not saved until you click Save to database)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.text_input("Title *", key="meta_title")
+        st.text_input("Authors", key="meta_authors")
+    with col2:
+        st.number_input("Year", min_value=1900, max_value=2100, step=1, key="meta_year")
+        st.text_input("Reviewer (your name)", key="meta_reviewer")
 
     st.markdown("---")
-    st.subheader("2) Scores by Dimension (products, normalised per dimension)")
-    if st.session_state["meta_title"]:
-        # Start from the last applied rows
-        current_rows = st.session_state["score_rows"].copy()
+    st.subheader("2) Scores by dimension")
 
-        # ---- Always-deferred mode: use a form so widgets don't re-run until submit ----
+    if rubric_df.empty:
+        st.error("Rubric not available right now. Please try reloading later.")
+    else:
+        # Single form that also performs the save
         with st.form("scores_form"):
-            edited_rows = current_rows.copy()
+            edited_rows = st.session_state["score_rows"].copy()
 
             for idx in edited_rows.index:
                 r = edited_rows.loc[idx]
                 key = (r["Dimension"], r["Sub-Dimension"])
 
                 with st.container():
-                    # Labels | Options | Score radio | Reason
                     c1, c2, c3, c4 = st.columns([2, 6, 2, 8])
 
                     # Labels
                     c1.write(f"**{r['Dimension']}**")
                     c1.write(r["Sub-Dimension"])
 
-                    # All rubric options inline (static list)
+                    # Options list
                     opts = mp.get(key, [])
                     if opts:
                         c2.markdown("**Options:**\n" + "\n".join([f"- **{s}** — {e}" for s, e in opts]))
@@ -464,23 +521,18 @@ with tabs[0]:
                         c2.info("No options found in rubric for this item.")
                         options_only = [0]
 
-                    # Compact radio for score
+                    # Score radio
                     current = int(r["Score"]) if pd.notnull(r["Score"]) else options_only[0]
                     try:
                         idx_opt = options_only.index(current)
                     except ValueError:
                         idx_opt = 0
 
-                    sel = radio_compat(
-                        "Score",
-                        options=options_only,
-                        index=idx_opt,
-                        key=f"score_radio_{idx}",
-                        horizontal=True,
-                    )
+                    sel = radio_compat("Score", options=options_only, index=idx_opt,
+                                       key=f"score_radio_{idx}", horizontal=True)
                     edited_rows.at[idx, "Score"] = sel
 
-                    # Larger comment box
+                    # Reason box
                     reason = c4.text_area(
                         "Reason / Notes",
                         value=r.get("Reason", ""),
@@ -492,103 +544,60 @@ with tabs[0]:
 
                     st.markdown("---")
 
-            # Single commit point: save to DB ONLY when this button is pressed
-            submitted = st.form_submit_button("Apply scores (Save to database)")
-            if submitted:
-                # Persist staged rows locally
+            # Single save button (writes metadata + scores)
+            saved = st.form_submit_button("Save to database")
+            if saved:
+                # Persist staged rows locally so nothing is lost on hiccup
                 st.session_state["score_rows"] = edited_rows
 
-                # Compute results from the applied rows
-                weights_df_local = load_weights_df()
-                wnorm_map_local = weights_normalised(weights_df_local, dim_order)
-                dim_scores = compute_dimension_scores(edited_rows, mp)
-                final_score = final_impact_score(dim_scores, wnorm_map_local)
+                # Validate minimal metadata
+                if not st.session_state["meta_title"]:
+                    st.error("Please enter a Title before saving.")
+                    st.stop()
 
-                # Write to DB (insert or update), using the currently staged metadata
+                if not DB_OK:
+                    st.error("Database is currently unavailable. Your inputs are safe on this page—click Retry at the top, then Save again.")
+                    st.stop()
+
                 meta = {
                     "title": st.session_state["meta_title"],
                     "authors": st.session_state["meta_authors"],
                     "year": int(st.session_state["meta_year"]) if st.session_state["meta_year"] else None,
                     "reviewer": st.session_state["meta_reviewer"]
                 }
-                sid = upsert_study(meta, edited_rows, st.session_state.get("editing_study_id"))
-                st.session_state["editing_study_id"] = sid
 
-                st.success(f"Saved study ID {sid}")
+                try:
+                    sid = upsert_study(meta, edited_rows, st.session_state.get("editing_study_id"))
+                    st.session_state["editing_study_id"] = sid
+                    st.success(f"Saved study ID {sid}")
+                except Exception as e:
+                    st.error(f"Save failed due to a DB error: {e}. Your form entries are still here—press Save again once the DB is reachable.")
+                    st.stop()
 
-                # Show a concise results summary right after saving
-                cols = st.columns(3)
-                with cols[0]:
-                    st.write("**Raw products**")
-                    for d in dim_order:
-                        st.write(f"- {d}: {dim_scores.get(d, {'raw': 0.0})['raw']:g}")
-                with cols[1]:
-                    st.write("**Max products**")
-                    for d in dim_order:
-                        st.write(f"- {d}: {dim_scores.get(d, {'max': 0.0})['max']:g}")
-                with cols[2]:
-                    st.write("**Normalised (0–1)**")
-                    for d in dim_order:
-                        st.write(f"- {d}: {dim_scores.get(d, {'norm': 0.0})['norm']:.3f}")
-
-                st.write("**Normalised weights:**")
-                st.write("\n".join([f"- {d}: w={wnorm_map_local.get(d, 0.0):.3f}" for d in dim_order]))
-                st.write(f"**Final IMPACT adoptability score:** `{final_score:.3f}`")
-
-    else:
-        st.info("Enter study metadata above, then set scores here.")
-
-
-
-
-    # Save / Update button stays the same (writes to DB only when clicked)
-    is_editing = st.session_state.get("editing_study_id") is not None
-    btn_label = "Update existing study" if is_editing else "Save as new study"
-    if st.button(btn_label):
-        meta = {
-            "title": st.session_state["meta_title"],
-            "authors": st.session_state["meta_authors"],
-            "year": int(st.session_state["meta_year"]) if st.session_state["meta_year"] else None,
-            "reviewer": st.session_state["meta_reviewer"]
-        }
-        sid = upsert_study(meta, st.session_state["score_rows"], st.session_state["editing_study_id"])
-        st.session_state["editing_study_id"] = sid
-        st.success(f"{'Updated' if is_editing else 'Saved'} study ID {sid}")
-
-
-# ---- Tab 2: Weights & Rationale ----
+# ---------------------------------------
+# TAB 2: BROWSE DATABASE (with summaries)
+# ---------------------------------------
 with tabs[1]:
-    st.subheader("Global weights (base weights; they get normalised automatically)")
-    st.caption("Change base weights and reasons below. The final score uses normalised weights that sum to 1.")
-    weights_df = load_weights_df()
-    current = {row["dimension"]: (float(row["base_weight"]), row["reason"]) for _, row in weights_df.iterrows()}
+    st.subheader("Search & export")
+    if DB_OK:
+        try:
+            df_scores = all_studies_scores_df()
+        except Exception:
+            st.info("Scores view unavailable right now—DB connection issue.")
+            df_scores = pd.DataFrame()
+    else:
+        df_scores = pd.DataFrame()
 
-    with st.form("weights_form"):
-        edits = {}
-        for d in dim_order:
-            base_w, reason = current.get(d, (0.0, ""))
-            st.markdown(f"### {d}")
-            w = st.number_input(f"Base weight for {d}", min_value=0.0, step=0.1, value=float(base_w), key=f"w_{d}")
-            r = st.text_area(f"Reason for {d}", value=reason, key=f"r_{d}", height=100,
-                             placeholder="Explain why this dimension should be emphasised or down-weighted.")
-            st.markdown("---")
-            edits[d] = (w, r)
-        submitted = st.form_submit_button("Save weights")
-        if submitted:
-            save_weights(edits)
-            st.success("Weights saved. Scores will reflect the new weights immediately.")
+    # Load weights fresh for scoring summaries
+    if DB_OK:
+        try:
+            weights_df = load_weights_df()
+        except Exception:
+            weights_df = pd.DataFrame(columns=["dimension","base_weight","reason","updated_at"])
+    else:
+        weights_df = pd.DataFrame(columns=["dimension","base_weight","reason","updated_at"])
 
-    weights_df = load_weights_df()
-    wnorm_map = weights_normalised(weights_df, dim_order)
-    st.write("**Current normalised weights:**")
-    df_show(pd.DataFrame([{"Dimension": d, "Normalised Weight": wnorm_map.get(d, 0.0)} for d in dim_order]))
-
-# ---- Tab 3: Browse ----
-with tabs[2]:
-    st.subheader("Search & Export")
-    df_scores = all_studies_scores_df()
-    weights_df = load_weights_df()
-    wnorm_map = weights_normalised(weights_df, dim_order)
+    wnorm_map = weights_normalised(weights_df, dim_order) if not weights_df.empty else {d: 1/len(dim_order) for d in dim_order} if dim_order else {}
 
     if not df_scores.empty:
         colf1, colf2, colf3 = st.columns(3)
@@ -620,8 +629,8 @@ with tabs[2]:
                 "Score": g["score"].fillna(0).astype(int),
                 "Reason": g["reason"].fillna("")
             })
-            dscores = compute_dimension_scores(rows, mp)
-            final = final_impact_score(dscores, wnorm_map)
+            dscores = compute_dimension_scores(rows, mp) if not rows.empty else {}
+            final = final_impact_score(dscores, wnorm_map) if dscores else 0.0
             meta = g.iloc[0]
             overall_rows.append({
                 "Study ID": sid,
@@ -634,26 +643,7 @@ with tabs[2]:
         sdf = pd.DataFrame(overall_rows).sort_values(by="Study ID", ascending=False)
         df_show(sdf)
 
-        st.write("### Drill into a study")
-        ids = sorted(view["id"].dropna().unique().tolist(), reverse=True)
-        if ids:
-            sid = selectbox_compat("Choose Study ID", options=ids)
-            sg = df_scores[df_scores["id"] == sid]
-            rows = pd.DataFrame({
-                "Dimension": sg["dimension"],
-                "Sub-Dimension": sg["subdimension"],
-                "Score": sg["score"].fillna(0).astype(int),
-                "Reason": sg["reason"].fillna("")
-            })
-            dscores = compute_dimension_scores(rows, mp)
-            final = final_impact_score(dscores, wnorm_map)
-            st.write(f"**Final IMPACT adoptability score:** `{final:.3f}`")
-            br = []
-            for d in dim_order:
-                info = dscores.get(d, {"raw": 0.0, "max": 0.0, "norm": 0.0})
-                br.append({"Dimension": d, "Raw product": info["raw"], "Max product": info["max"], "Normalised": round(info["norm"], 3)})
-            df_show(pd.DataFrame(br))
-
+        # Export summary
         try:
             csv2 = sdf.to_csv(index=False).encode("utf-8")
             st.download_button("Download summary (CSV)", data=csv2, file_name="studies_summary.csv", mime="text/csv")
@@ -662,12 +652,63 @@ with tabs[2]:
     else:
         st.info("No studies yet. Add one in the 'Score a Case Study' tab.")
 
-# ---- Tab 4: Manage Rubric ----
+# -------------------------------------
+# TAB 3: WEIGHTS & RATIONALE (editable)
+# -------------------------------------
+with tabs[2]:
+    st.subheader("Global weights (base weights; they get normalised automatically)")
+    st.caption("Change base weights and reasons below. The final score uses normalised weights that sum to 1.")
+
+    if not DB_OK:
+        st.warning("DB is unavailable; cannot edit weights right now.")
+    else:
+        try:
+            weights_df = load_weights_df()
+        except Exception:
+            weights_df = pd.DataFrame(columns=["dimension","base_weight","reason","updated_at"])
+
+        current = {row["dimension"]: (float(row["base_weight"]), row["reason"]) for _, row in weights_df.iterrows()}
+
+        with st.form("weights_form"):
+            edits = {}
+            for d in dim_order:
+                base_w, reason = current.get(d, (0.0, ""))
+                st.markdown(f"### {d}")
+                w = st.number_input(f"Base weight for {d}", min_value=0.0, step=0.1, value=float(base_w), key=f"w_{d}")
+                r = st.text_area(f"Reason for {d}", value=reason, key=f"r_{d}", height=100,
+                                 placeholder="Explain why this dimension should be emphasised or down-weighted.")
+                st.markdown("---")
+                edits[d] = (w, r)
+
+            submitted = st.form_submit_button("Save weights")
+            if submitted:
+                try:
+                    save_weights(edits)
+                    st.success("Weights saved.")
+                except Exception as e:
+                    st.error(f"Failed to save weights: {e}")
+
+        # Show normalised weights preview
+        try:
+            weights_df = load_weights_df()
+            wnorm_map = weights_normalised(weights_df, dim_order)
+            st.write("**Current normalised weights:**")
+            df_show(pd.DataFrame([{"Dimension": d, "Normalised Weight": wnorm_map.get(d, 0.0)} for d in dim_order]))
+        except Exception:
+            st.info("Could not load weights for preview.")
+
+# -------------------------
+# TAB 4: MANAGE RUBRIC
+# -------------------------
 with tabs[3]:
     st.write("View or export the current rubric.")
-    df_show(rubric_df)
-    try:
-        csv3 = rubric_df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download rubric (CSV)", data=csv3, file_name="rubric_definitions.csv", mime="text/csv")
-    except Exception:
-        pass
+    if DB_OK:
+        try:
+            df = load_rubric_df()
+            df_show(df)
+            csv3 = df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download rubric (CSV)", data=csv3, file_name="rubric_definitions.csv", mime="text/csv")
+        except Exception:
+            st.info("Rubric unavailable right now.")
+    else:
+        st.info("Rubric unavailable: DB not connected.")
